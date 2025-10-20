@@ -24,6 +24,10 @@ from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
+import atexit
+import json
+import time
+import hashlib
 
 import datasets
 import torch
@@ -36,6 +40,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import DataLoader, Sampler
 from transformers import (
     AutoConfig,
+    AutoModelForCausalLM,
     AutoModelForSequenceClassification,
     AutoProcessor,
     AutoTokenizer,
@@ -81,6 +86,30 @@ if is_vllm_available():
 
 if is_wandb_available():
     import wandb
+
+def loss_graph_size(loss: torch.Tensor):
+    """
+    Compute the size of the autograd graph for a given loss tensor.
+    """
+    seen = set()
+    queue = deque([loss.grad_fn])
+    depths = deque([0])
+    nodes = 0
+    edges = 0
+    max_depth = 0
+    while queue:
+        current, current_depth = queue.popleft(), depths.popleft()
+        if current is None or current in seen:
+            continue
+        seen.add(current)
+        nodes += 1
+        if current_depth > max_depth:
+            max_depth = current_depth
+        for next_fn, _ in current.next_functions:
+            queue.append(next_fn)
+            depths.append(current_depth + 1)
+            edges += 1
+    return nodes, edges, max_depth
 
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
@@ -528,9 +557,13 @@ class GRPOTrainer(Trainer):
                     f"a `torch.dtype` (e.g., 'float32'), but got {torch_dtype}."
                 )
             # Disable caching if gradient checkpointing is enabled (not supported)
+            # made a change here
             config = AutoConfig.from_pretrained(model_id)
+            '''
             architecture = getattr(transformers, config.architectures[0])
             model = architecture.from_pretrained(model_id, **model_init_kwargs)
+            '''
+            model = AutoModelForCausalLM.from_pretrained(model_id, **model_init_kwargs)
         else:
             model_id = model.config._name_or_path
             if args.model_init_kwargs is not None:
@@ -712,8 +745,13 @@ class GRPOTrainer(Trainer):
         else:
             # For deepspeed, fsdp or non-distributed models, create a reference model from scratch
             config = AutoConfig.from_pretrained(model_id)
+            
+            # changed this so it works with my custom models
+            '''
             architecture = getattr(transformers, config.architectures[0])
             self.ref_model = architecture.from_pretrained(model_id, **model_init_kwargs)
+            '''
+            self.ref_model = AutoModelForCausalLM.from_pretrained(model_id, **model_init_kwargs)
 
         # Disable dropout in the models
         if args.disable_dropout:
@@ -754,6 +792,11 @@ class GRPOTrainer(Trainer):
             "rewards": defaultdict(lambda: deque(maxlen=args.generation_batch_size)),
             "advantages": deque(maxlen=args.generation_batch_size),
         }
+
+        # open a completion logging file
+        if self.args.save_completions and self.accelerator.is_main_process:
+            self.completions_save_file = open(os.path.join(args.output_dir, "completions.jsonl"), 'w')
+            atexit.register(self.completions_save_file.close)
 
         # Ensure each process receives a unique seed to prevent duplicate completions when generating with
         # transformers if num_generations exceeds per_device_train_batch_size. We could skip it if we use vLLM, but
@@ -1299,6 +1342,18 @@ class GRPOTrainer(Trainer):
         # Repeat all input columns (but "prompt", "completion", and "completion_ids") to match the num of generations
         keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
         reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if os.environ.get("GRPO_LOG_REWARD_INPUTS", "0") == "1":
+            print(f"Rank {rank} calculating rewards")
+            with open(os.path.join(self.args.output_dir, f"rank_{rank}_reward_inputs.jsonl"), "a") as f:
+                f.write(json.dumps({
+                    'prompts': prompts,
+                    'completions': completions,
+                    **reward_kwargs
+                }) + "\n")
+                f.flush()
+            print(f"Rank {rank} finished writing reward inputs")
 
         # This allows for dynamic reward shaping based on training progress.
         reward_kwargs["trainer_state"] = self.state
@@ -1341,8 +1396,54 @@ class GRPOTrainer(Trainer):
 
         # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
         # completions may be distributed across processes
+        print(f"Rank {rank} gathering rewards...")
         rewards_per_func = gather(rewards_per_func)
+        print(f"Rank {rank} finished gathering!")
         return rewards_per_func
+
+    @staticmethod
+    def _tensor_hash(tensor: torch.Tensor) -> str:
+        """Computes a SHA256 hash of a tensor's contents."""
+        if tensor is None:
+            return "none"
+        tc = tensor.detach().cpu().contiguous()
+        h = hashlib.sha256()
+        h.update(str(tc.dtype).encode())
+        h.update(str(tc.size()).encode())
+        mv = memoryview(tc.numpy())
+        h.update(mv)
+        return h.hexdigest()
+
+    def _file_name(self, chunk_prompt_ids: torch.Tensor, micro_gen_step: int) -> str:
+        """Generates the cache file path for the given chunk prompt ids and micro gen step"""
+        prompt_hash = self._tensor_hash(chunk_prompt_ids)
+        filename = f"cache_step{self._step}_mgs{micro_gen_step}_prompt{prompt_hash}.pt"
+        return filename
+
+    def _cached_generation(self, unwrapped_model, chunk_prompt_inputs, micro_gen_step):
+        """Tries to find a cached generation for the given chunk prompt inputs and micro gen step.  If found, it is returned.  Otherwise
+         it is computed, saved and returned.
+        """
+        cache_dir = os.environ.get("GEN_CACHE_DIR", None)
+        if cache_dir is None:
+            cache_dir = self.args.output_dir
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        rank_dir = os.path.join(cache_dir, f"rank{rank}")
+        if not os.path.exists(rank_dir):
+            os.makedirs(rank_dir, exist_ok=True)
+        filename = os.path.join(rank_dir, self._file_name(chunk_prompt_inputs["input_ids"], micro_gen_step))
+        if os.path.exists(filename):
+            print(f"[Rank {rank}] Cache hit for {filename}")
+            cached = torch.load(filename, map_location=self.accelerator.device)
+            return cached["chunk_completion_ids"]
+        else:
+            print(f"[Rank {rank}] Cache miss for {filename}.  Generating...")
+            chunk_completion_ids = unwrapped_model.generate(
+                **chunk_prompt_inputs, generation_config=self.generation_config, disable_compile=True
+            )
+            torch.save({"chunk_completion_ids": chunk_completion_ids}, filename)
+            print(f"[Rank {rank}] Saved generation to {filename}")
+            return chunk_completion_ids
 
     def _generate_and_score_completions(
         self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
@@ -1594,9 +1695,54 @@ class GRPOTrainer(Trainer):
                 FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
             ):
                 prompt_inputs["input_ids"], prompt_inputs["attention_mask"] = prompt_ids, prompt_mask
-                prompt_completion_ids = unwrapped_model.generate(
-                    **prompt_inputs, generation_config=self.generation_config, disable_compile=True
-                )
+                if not has_images:
+                    # instead of computing all generations at once, compute them in chunks of self.args.per_device_train_batch_size
+                    # chunk size should always divide generation_batch_size...
+                    chunk_size = (
+                        self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
+                    )
+                    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                    gen_start_time = time.time()
+                    print(f"Rank {rank} starting generation")
+                    total_completion_tokens = 0
+                    chunk_completions = []
+                    for micro_gen_step, chunk_idx in enumerate(range(0, prompt_ids.size(0), chunk_size)):
+                        start_time = time.time()
+                        print(f"Rank {rank} starting {chunk_idx} to {chunk_idx + chunk_size - 1}...")
+                        chunk_prompt_inputs = {k: v[chunk_idx : chunk_idx + chunk_size] if isinstance(v, torch.Tensor) else v 
+                                            for k, v in prompt_inputs.items()}
+                        if os.environ.get("CACHE_GENERATION", "0") == "1":
+                            chunk_completion_ids = self._cached_generation(unwrapped_model, chunk_prompt_inputs, micro_gen_step)
+                        else:
+                            chunk_completion_ids = unwrapped_model.generate(
+                                **chunk_prompt_inputs, generation_config=self.generation_config, disable_compile=True
+                            )
+                        time_taken = time.time() - start_time
+                        completion_length = chunk_completion_ids.size(1) - chunk_prompt_inputs['input_ids'].size(1)
+                        print(f"Rank {rank} finished {chunk_idx} to {chunk_idx + chunk_size - 1}, took {time_taken:.2f} seconds, length: {completion_length} tokens, throughput: {completion_length * chunk_size / time_taken:.2f}")
+                        total_completion_tokens += completion_length * chunk_completion_ids.size(0)
+                        chunk_completions.append(chunk_completion_ids)
+
+                        # barrier every args.barrier_every
+                        if (micro_gen_step + 1) % self.args.barrier_every == 0 and torch.distributed.is_initialized():
+                            print(f"Rank {rank} waiting at generation barrier after {micro_gen_step + 1} micro steps")
+                            self.accelerator.wait_for_everyone()
+                            print(f"Rank {rank} passed the generation barrier")
+
+                    # combine all chunks by copying them into a preallocated tensor
+                    max_chunk_len = max([c.size(1) for c in chunk_completions])
+                    prompt_completion_ids = torch.full(
+                        (prompt_ids.size(0), max_chunk_len), self.pad_token_id, dtype=torch.long, device=device
+                    )
+                    for chunk_idx, chunk_completion_ids in zip(range(0, prompt_ids.size(0), chunk_size), chunk_completions):
+                        prompt_completion_ids[
+                            chunk_idx : chunk_idx + chunk_size, : chunk_completion_ids.size(1)
+                            ] = chunk_completion_ids
+                    print(f"Rank {rank} finished generation.  Completion tokens: {total_completion_tokens}, total time: {time.time() - gen_start_time:.2f}, overall throughput: {total_completion_tokens/(time.time() - gen_start_time):.2f} tokens/sec")
+                else:
+                    prompt_completion_ids = unwrapped_model.generate(
+                        **prompt_inputs, generation_config=self.generation_config, disable_compile=True
+                    )
             # Compute prompt length and extract completion ids
             prompt_length = prompt_ids.size(1)
             prompt_ids = prompt_completion_ids[:, :prompt_length]
@@ -1843,6 +1989,30 @@ class GRPOTrainer(Trainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        n_sequences = input_ids.size(0)
+        seq_len = input_ids.size(1)
+        start_time = time.time()
+        print(f"Rank {rank} computing loss on {n_sequences} sequences of length {seq_len} at t={start_time:.2f}")
+        if os.environ.get("SHOULD_DUMP") == "1":
+            print(f"Rank {rank} dumping inputs...")
+            dump_path = os.path.join(self.args.output_dir, f"rank{rank}")
+            os.makedirs(dump_path, exist_ok=True)
+            save_obj = {
+                "prompt_ids": prompt_ids.cpu(),
+                "prompt_mask": prompt_mask.cpu(),
+                "completion_ids": completion_ids.cpu(),
+                "completion_mask": completion_mask.cpu(),
+                "input_ids": input_ids.cpu(),
+                "attention_mask": attention_mask.cpu(),
+                "logits_to_keep": logits_to_keep,
+                "ref_per_token_logps": inputs.get("ref_per_token_logps").cpu() if inputs.get("ref_per_token_logps") is not None else None,
+                "old_per_token_logps": inputs.get("old_per_token_logps").cpu() if inputs.get("old_per_token_logps") is not None else None,
+                "advantages": inputs.get("advantages").cpu(),
+            }
+            torch.save(save_obj, os.path.join(dump_path, 'inputs.pt'))
+            print(f"Rank {rank} dumped inputs")
+
         # Compute the per_token_logps and the entropy at each position in the completion
         per_token_logps, entropies = self._get_per_token_logps_and_entropies(
             model,
@@ -1949,6 +2119,12 @@ class GRPOTrainer(Trainer):
         self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
         gathered_clip_ratio = self.accelerator.gather(clip_ratio)
         self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
+
+        time_taken = time.time() - start_time
+        print(f"Rank {rank} finished computing loss, took {time_taken:.2f} seconds")
+        nodes, edges, depth = loss_graph_size(loss)
+        print(f"Rank {rank} loss graph size:\n\tNodes: {nodes}\n\tEdges: {edges}\n\tDepth: {depth}")
+
         return loss
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
@@ -1972,41 +2148,61 @@ class GRPOTrainer(Trainer):
         super().log(logs, start_time)
         self._metrics[mode].clear()
 
-        if self.accelerator.is_main_process and self.log_completions:
-            if is_rich_available():
-                print_prompt_completions_sample(
-                    self._logs["prompt"],
-                    self._logs["completion"],
-                    self._logs["rewards"],
-                    self._logs["advantages"],
-                    self.state.global_step,
-                    self.num_completions_to_print,
-                )
+        if self.accelerator.is_main_process:
+            # if we are saving completions, then structure them and write to the output file
+            if self.args.save_completions:
+                # each line consists of a prompt and its completions
+                for i in range(0, len(self._logs["prompt"]), self.num_generations):
+                    prompt = self._logs["prompt"][i]
+                    completions = [self._logs["completion"][j] for j in range(i, i + self.num_generations)]
+                    rewards = [{name: self._logs["rewards"][name][j] for name in self.reward_func_names} for j in range(i, i + self.num_generations)]
+                    advantages = [self._logs["advantages"][j] for j in range(i, i + self.num_generations)]
+                    line = {
+                        'step': self.state.global_step,
+                        'prompt': prompt,
+                        'completions': [
+                            {'text': completion, 'advantage': advantage, **c_rewards} 
+                            for completion, advantage, c_rewards in zip(completions, advantages, rewards)
+                        ]
+                    }
+                    self.completions_save_file.write(json.dumps(line) + "\n")
+                self.completions_save_file.flush()
 
-            if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
-                import pandas as pd
+            if self.log_completions:
+                if is_rich_available():
+                    print_prompt_completions_sample(
+                        self._logs["prompt"],
+                        self._logs["completion"],
+                        self._logs["rewards"],
+                        self._logs["advantages"],
+                        self.state.global_step,
+                        self.num_completions_to_print,
+                    )
 
-                table = {
-                    "step": [str(self.state.global_step)] * len(self._logs["prompt"]),
-                    "prompt": self._logs["prompt"],
-                    "completion": self._logs["completion"],
-                    **self._logs["rewards"],
-                    "advantage": self._logs["advantages"],
-                }
+                if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
+                    import pandas as pd
 
-                if self._logs["image"]:
-                    table["image"] = []
-                    for img in self._logs["image"]:
-                        if img is not None:
-                            # Convert images to wandb Image objects for proper visualization
-                            table["image"].append(wandb.Image(img))
-                        else:
-                            table["image"].append(None)
+                    table = {
+                        "step": [str(self.state.global_step)] * len(self._logs["prompt"]),
+                        "prompt": self._logs["prompt"],
+                        "completion": self._logs["completion"],
+                        **self._logs["rewards"],
+                        "advantage": self._logs["advantages"],
+                    }
 
-                df = pd.DataFrame(table)
-                if self.wandb_log_unique_prompts:
-                    df = df.drop_duplicates(subset=["prompt"])
-                wandb.log({"completions": wandb.Table(dataframe=df)})
+                    if self._logs["image"]:
+                        table["image"] = []
+                        for img in self._logs["image"]:
+                            if img is not None:
+                                # Convert images to wandb Image objects for proper visualization
+                                table["image"].append(wandb.Image(img))
+                            else:
+                                table["image"].append(None)
+
+                    df = pd.DataFrame(table)
+                    if self.wandb_log_unique_prompts:
+                        df = df.drop_duplicates(subset=["prompt"])
+                    wandb.log({"completions": wandb.Table(dataframe=df)})
 
     # Ensure the model card is saved along with the checkpoint
     def _save_checkpoint(self, model, trial):

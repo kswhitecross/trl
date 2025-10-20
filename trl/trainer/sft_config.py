@@ -247,6 +247,12 @@ class SFTConfig(TrainingArguments):
         default=False,
         metadata={"help": "Whether to offload the activations to the CPU."},
     )
+    use_logits_to_keep: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to use logits_to_keep during training to massively reduce VRAM by not materializing the logits of the prompt input_ids."
+        },
+    )
 
     def __post_init__(self):
         self.bf16 = not (self.fp16) if self.bf16 is None else self.bf16

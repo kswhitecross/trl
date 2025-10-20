@@ -21,6 +21,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar, Union
+import inspect
 
 import torch
 import torch.nn as nn
@@ -855,6 +856,23 @@ class SFTTrainer(Trainer):
         Compute training loss and additionally compute token accuracies
         """
         mode = "train" if self.model.training else "eval"
+        # use the logits_to_keep argument if we're not packing or padding_free and the model supports it
+        if self.args.use_logits_to_keep:
+            if not self.args.packing and not self.args.padding_free and \
+                'logits_to_keep' in inspect.signature(self.model.forward).parameters.keys() and \
+                    "labels" in inputs:
+                # only compute logits for tokens where the label is not -100
+                labels = inputs['labels']
+                leading_mask = (labels == -100).cumprod(dim=1)
+                leading_ignore_counts = leading_mask.sum(dim=1)
+                min_leading_ignore_count = leading_ignore_counts.min().item()
+                logits_to_keep = labels.size(1) - min_leading_ignore_count
+                # add one for the shift
+                logits_to_keep += 1
+                inputs['logits_to_keep'] = logits_to_keep
+                # truncate the labels
+                inputs['labels'] = labels[:, -logits_to_keep:]
+
         (loss, outputs) = super().compute_loss(
             model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch
         )

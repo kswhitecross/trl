@@ -585,6 +585,21 @@ class GRPOConfig(TrainingArguments):
             "all prompts are logged."
         },
     )
+    save_completions: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to save the completions to a file. If `True`, the completions are saved to a file in the "
+            "`output_dir` directory with the name `completions.jsonl`."
+        },
+    )
+    barrier_every: int = field(
+        default=8,
+        metadata={
+            "help": "Number of micro steps between each barrier synchronization across GPUs during generation. Increasing "
+            "this value can improve performance, but it also increases the risk of a NCCL Process Timeout if one GPU takes"
+            " too long to finish its generation."
+        }
+    )
 
     def __post_init__(self):
         self.bf16 = not (self.fp16) if self.bf16 is None else self.bf16
